@@ -36,6 +36,53 @@ Or with Docker:
 docker build -t reclip . && docker run -p 8899:8899 reclip
 ```
 
+## Configuration
+
+All settings are environment variables — no config files:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `AUTH_TOKEN` | *(empty — auth off)* | Access token required to use the app. **Set this before exposing to the internet.** |
+| `FILE_TTL_MINUTES` | `60` | Downloaded files and finished jobs are auto-deleted after this many minutes |
+| `MAX_CONCURRENT_DOWNLOADS` | `2` | Simultaneous yt-dlp downloads; extra jobs wait in a queue |
+| `MAX_FILESIZE` | `2G` | Per-file size limit passed to yt-dlp |
+| `DOWNLOAD_TIMEOUT` | `300` | Per-download timeout in seconds |
+| `YTDLP_COOKIES_FILE` | *(empty)* | Path to a Netscape-format cookies file, passed to yt-dlp (`--cookies`). Helps with "confirm you're not a bot" checks on datacenter IPs |
+| `DOWNLOAD_DIR` | `./downloads` (`/tmp/reclip-downloads` in Docker) | Where files are staged before being sent to the browser |
+| `PORT` | `8899` | Listen port (honored by cloud platforms that inject `PORT`) |
+
+## Cloud Deployment
+
+The container is self-contained — no external storage or database. Files are staged
+in a temp dir inside the container, streamed to the browser on demand, and
+auto-cleaned by a background janitor after `FILE_TTL_MINUTES`.
+
+Deploy the image to any container platform (a VPS with Docker, Fly.io, Cloud Run,
+Railway, Render...). Two things to remember:
+
+1. **Always set `AUTH_TOKEN`** — an open downloader on a public address will be
+   found and abused within hours:
+
+   ```bash
+   docker run -d -p 8899:8899 -e AUTH_TOKEN=your-secret-token reclip
+   ```
+
+2. **Datacenter IPs get bot-checked.** YouTube in particular may refuse downloads
+   from cloud provider IPs. If that happens, export cookies from your browser
+   (e.g. with the "Get cookies.txt" extension), mount the file into the container
+   and point `YTDLP_COOKIES_FILE` at it:
+
+   ```bash
+   docker run -d -p 8899:8899 \
+     -e AUTH_TOKEN=your-secret-token \
+     -e YTDLP_COOKIES_FILE=/data/cookies.txt \
+     -v ./cookies.txt:/data/cookies.txt:ro \
+     reclip
+   ```
+
+Job state lives in process memory, so run a single container instance (the
+default gunicorn config already does the right thing: 1 worker, 8 threads).
+
 ## Usage
 
 1. Paste one or more video URLs into the input box

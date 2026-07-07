@@ -474,6 +474,7 @@
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ url }),
           });
+          if (res.status === 401) { window.location = '/login'; return; }
           const data = await res.json();
           if (data.error) {
             cardData[idx] = { ...cardData[idx], status: 'info-error', error: data.error };
@@ -567,13 +568,15 @@
       let actionHtml = '';
       if (c.status === 'ready') {
         actionHtml = `<button class="card-dl-btn" onclick="dlCard(${idx})">Download</button>${qualityChips}`;
+      } else if (c.status === 'queued') {
+        actionHtml = `<span class="card-status downloading"><span class="spin"></span> Queued...</span>`;
       } else if (c.status === 'downloading') {
         actionHtml = `<span class="card-status downloading"><span class="spin"></span> Downloading...</span>`;
       } else if (c.status === 'done') {
         actionHtml = `<button class="card-dl-btn done" onclick="saveCard(${idx})">Save</button>
           <span class="card-status done">${esc(c.filename || '')}</span>`;
       } else if (c.status === 'saved') {
-        actionHtml = `<button class="card-dl-btn" onclick="dlCard(${idx})">Download Again</button>
+        actionHtml = `<button class="card-dl-btn" onclick="saveCard(${idx})">Save Again</button>
           <span class="card-status done">Sent to browser: ${esc(c.filename || '')}</span>`;
       } else if (c.status === 'error') {
         actionHtml = `<button class="card-dl-btn" onclick="dlCard(${idx})">Retry</button>
@@ -623,6 +626,7 @@
             title: c.title || '',
           }),
         });
+        if (res.status === 401) { window.location = '/login'; return; }
         const data = await res.json();
         if (data.error) {
           c.status = 'error';
@@ -644,6 +648,7 @@
       const iv = setInterval(async () => {
         try {
           const res = await fetch(`/api/status/${c.jobId}`);
+          if (res.status === 401) { clearInterval(iv); window.location = '/login'; return; }
           const data = await res.json();
           if (data.status === 'done') {
             clearInterval(iv);
@@ -656,6 +661,11 @@
             c.status = 'error';
             c.error = data.error;
             renderCard(idx);
+          } else if (data.status === 'queued' || data.status === 'downloading') {
+            if (c.status !== data.status) {
+              c.status = data.status;
+              renderCard(idx);
+            }
           }
         } catch {
           clearInterval(iv);
@@ -666,9 +676,19 @@
       }, 1000);
     }
 
-    function saveCard(idx) {
+    async function saveCard(idx) {
       const c = cardData[idx];
       if (!c.jobId) return;
+      try {
+        const res = await fetch(`/api/status/${c.jobId}`);
+        if (res.status === 401) { window.location = '/login'; return; }
+        const data = await res.json();
+        if (data.status !== 'done') throw new Error('expired');
+      } catch {
+        // File expired on the server — re-download from source
+        dlCard(idx);
+        return;
+      }
       const a = document.createElement('a');
       a.href = `/api/file/${c.jobId}`;
       a.download = c.filename || '';
