@@ -572,6 +572,9 @@
       } else if (c.status === 'done') {
         actionHtml = `<button class="card-dl-btn done" onclick="saveCard(${idx})">Save</button>
           <span class="card-status done">${esc(c.filename || '')}</span>`;
+      } else if (c.status === 'saved') {
+        actionHtml = `<button class="card-dl-btn" onclick="dlCard(${idx})">Download Again</button>
+          <span class="card-status done">Sent to browser: ${esc(c.filename || '')}</span>`;
       } else if (c.status === 'error') {
         actionHtml = `<button class="card-dl-btn" onclick="dlCard(${idx})">Retry</button>
           <span class="card-status error">${esc(friendlyError(c.error || 'Download failed'))}</span>`;
@@ -670,6 +673,8 @@
       a.href = `/api/file/${c.jobId}`;
       a.download = c.filename || '';
       a.click();
+      c.status = 'saved';
+      renderCard(idx);
     }
 
     async function dlAll() {

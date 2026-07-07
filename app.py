@@ -7,10 +7,27 @@ import threading
 from flask import Flask, request, jsonify, send_file, render_template
 
 app = Flask(__name__)
-DOWNLOAD_DIR = os.path.join(os.path.dirname(__file__), "downloads")
+DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", os.path.join(os.path.dirname(__file__), "downloads"))
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 jobs = {}
+
+
+def cleanup_job_files(job_id):
+    for file_path in glob.glob(os.path.join(DOWNLOAD_DIR, f"{job_id}.*")):
+        try:
+            os.remove(file_path)
+        except OSError:
+            pass
+
+
+if os.environ.get("CLEAN_DOWNLOAD_DIR_ON_START") == "1":
+    for file_path in glob.glob(os.path.join(DOWNLOAD_DIR, "*")):
+        if os.path.isfile(file_path):
+            try:
+                os.remove(file_path)
+            except OSError:
+                pass
 
 
 def run_download(job_id, url, format_choice, format_id):
@@ -33,6 +50,7 @@ def run_download(job_id, url, format_choice, format_id):
         if result.returncode != 0:
             job["status"] = "error"
             job["error"] = result.stderr.strip().split("\n")[-1]
+            cleanup_job_files(job_id)
             return
 
         files = glob.glob(os.path.join(DOWNLOAD_DIR, f"{job_id}.*"))
@@ -68,9 +86,11 @@ def run_download(job_id, url, format_choice, format_id):
     except subprocess.TimeoutExpired:
         job["status"] = "error"
         job["error"] = "Download timed out (5 min limit)"
+        cleanup_job_files(job_id)
     except Exception as e:
         job["status"] = "error"
         job["error"] = str(e)
+        cleanup_job_files(job_id)
 
 
 @app.route("/")
@@ -162,7 +182,27 @@ def download_file(job_id):
     job = jobs.get(job_id)
     if not job or job["status"] != "done":
         return jsonify({"error": "File not ready"}), 404
-    return send_file(job["file"], as_attachment=True, download_name=job["filename"])
+
+    file_path = job["file"]
+    filename = job["filename"]
+
+    file_handle = open(file_path, "rb")
+    response = send_file(file_handle, as_attachment=True, download_name=filename)
+
+    try:
+        os.remove(file_path)
+    except OSError:
+        pass
+    jobs.pop(job_id, None)
+
+    def close_file():
+        try:
+            file_handle.close()
+        except Exception:
+            pass
+
+    response.call_on_close(close_file)
+    return response
 
 
 if __name__ == "__main__":

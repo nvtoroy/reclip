@@ -1,0 +1,9 @@
+.git
+.gitignore
+.dockerignore
+__pycache__/
+*.py[cod]
+.DS_Store
+venv/
+downloads/
+assets/
