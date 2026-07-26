@@ -451,9 +451,42 @@
       if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); go(); }
     });
 
+    // A playlist URL proper — not a single video that merely carries &list=,
+    // which is what you get by opening a video from inside a playlist.
+    function isPlaylistUrl(url) {
+      try {
+        const u = new URL(url);
+        return u.searchParams.has('list') && !u.searchParams.has('v');
+      } catch {
+        return false;
+      }
+    }
+
+    async function expandPlaylists(urls) {
+      const out = [];
+      for (const url of urls) {
+        if (!isPlaylistUrl(url)) { out.push(url); continue; }
+        try {
+          const res = await fetch('/api/playlist', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url }),
+          });
+          if (res.status === 401) { window.location = '/login'; return null; }
+          const data = await res.json();
+          // Fall back to the original URL if the playlist can't be read —
+          // yt-dlp may still handle it as a single item.
+          out.push(...(data.urls?.length ? data.urls : [url]));
+        } catch {
+          out.push(url);
+        }
+      }
+      return [...new Set(out)];
+    }
+
     async function go() {
-      const urls = parseUrls(document.getElementById('urls').value);
-      if (!urls.length) return;
+      const parsed = parseUrls(document.getElementById('urls').value);
+      if (!parsed.length) return;
 
       const btn = document.getElementById('goBtn');
       const container = document.getElementById('cards');
@@ -461,6 +494,9 @@
       btn.textContent = 'Loading...';
       container.innerHTML = '';
       cardData = [];
+
+      const urls = await expandPlaylists(parsed);
+      if (urls === null) return;
 
       for (let i = 0; i < urls.length; i++) {
         const url = urls[i];

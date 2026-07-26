@@ -1,0 +1,84 @@
+name: Update yt-dlp
+
+# Site extractors break constantly, so the yt-dlp pin has to move often. Rather
+# than updating at container start (unreproducible builds, network dependency on
+# boot), bump the pin here, prove the image still builds, and open a PR.
+on:
+  schedule:
+    - cron: "17 6 * * 1" # Mondays, 06:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve latest yt-dlp release
+        id: latest
+        run: |
+          version=$(curl -fsSL https://pypi.org/pypi/yt-dlp/json | jq -r .info.version)
+          # This value ends up in a shell command and a branch name, so refuse
+          # anything that isn't a plain yt-dlp calver rather than trusting PyPI.
+          case "$version" in
+            [0-9][0-9][0-9][0-9].[0-9]*.[0-9]*) ;;
+            *) echo "unexpected version string: '$version'"; exit 1 ;;
+          esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Bump the pin
+        id: bump
+        env:
+          LATEST: ${{ steps.latest.outputs.version }}
+        run: |
+          current=$(sed -n 's/^yt-dlp==//p' requirements.txt)
+          echo "current=$current"
+          if [ "$current" = "$LATEST" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            sed -i "s/^yt-dlp==.*/yt-dlp==$LATEST/" requirements.txt
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "current=$current" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build the image
+        if: steps.bump.outputs.changed == 'true'
+        run: docker build -t reclip:ci .
+
+      - name: Smoke-test the container
+        if: steps.bump.outputs.changed == 'true'
+        run: |
+          docker run -d --name reclip-ci -p 8899:8899 reclip:ci
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8899/healthz > /dev/null; then
+              ok=1; break
+            fi
+            sleep 2
+          done
+          if [ -z "$ok" ]; then
+            echo "container never became healthy:"
+            docker logs reclip-ci
+            exit 1
+          fi
+          # The pinned yt-dlp must actually be the one that runs.
+          docker exec reclip-ci yt-dlp --version
+          docker rm -f reclip-ci
+
+      - name: Open a PR
+        if: steps.bump.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: chore/yt-dlp-${{ steps.latest.outputs.version }}
+          commit-message: "Bump yt-dlp to ${{ steps.latest.outputs.version }}"
+          title: "Bump yt-dlp to ${{ steps.latest.outputs.version }}"
+          body: |
+            Weekly yt-dlp refresh: `${{ steps.bump.outputs.current }}` → `${{ steps.latest.outputs.version }}`.
+
+            The image builds and `/healthz` responds with this pin.
+
+            Release notes: https://github.com/yt-dlp/yt-dlp/releases/tag/${{ steps.latest.outputs.version }}
+          delete-branch: true

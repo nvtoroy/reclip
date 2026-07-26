@@ -21,6 +21,7 @@ FILE_TTL_MINUTES = int(os.environ.get("FILE_TTL_MINUTES", "60"))
 MAX_CONCURRENT_DOWNLOADS = int(os.environ.get("MAX_CONCURRENT_DOWNLOADS", "2"))
 MAX_FILESIZE = os.environ.get("MAX_FILESIZE", "2G")
 DOWNLOAD_TIMEOUT = int(os.environ.get("DOWNLOAD_TIMEOUT", "300"))
+MAX_PLAYLIST_ITEMS = int(os.environ.get("MAX_PLAYLIST_ITEMS", "50"))
 # Optional Netscape-format cookies file for yt-dlp — helps with bot checks on datacenter IPs.
 YTDLP_COOKIES_FILE = os.environ.get("YTDLP_COOKIES_FILE", "")
 
@@ -28,12 +29,29 @@ jobs = {}
 download_slots = threading.BoundedSemaphore(MAX_CONCURRENT_DOWNLOADS)
 
 
-def ytdlp_cmd(*args):
-    cmd = ["yt-dlp", "--no-playlist"]
+def ytdlp_cmd(*args, no_playlist=True):
+    cmd = ["yt-dlp"]
+    if no_playlist:
+        cmd.append("--no-playlist")
     if YTDLP_COOKIES_FILE:
         cmd += ["--cookies", YTDLP_COOKIES_FILE]
     cmd += list(args)
     return cmd
+
+
+def parse_ytdlp_json(stdout):
+    """Parse yt-dlp JSON output.
+
+    With ``-j`` yt-dlp prints one JSON object per line. Some extractors emit
+    multiple videos even with ``--no-playlist``, so stdout holds several objects
+    and a plain ``json.loads`` raises "Extra data". Return the first one.
+    """
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        return json.loads(line)
+    raise ValueError("yt-dlp returned no data")
 
 
 def cleanup_job_files(job_id):
@@ -179,7 +197,7 @@ def do_download(job_id, url, format_choice, format_id):
         title = job.get("title", "").strip()
         # Sanitize title for filename
         if title:
-            safe_title = "".join(c for c in title if c not in r'\/:*?"<>|').strip()[:20].strip()
+            safe_title = "".join(c for c in title if c not in r'\/:*?"<>|').strip()[:100].strip()
             job["filename"] = f"{safe_title}{ext}" if safe_title else os.path.basename(chosen)
         else:
             job["filename"] = os.path.basename(chosen)
@@ -211,7 +229,7 @@ def get_info():
         if result.returncode != 0:
             return jsonify({"error": result.stderr.strip().split("\n")[-1]}), 400
 
-        info = json.loads(result.stdout)
+        info = parse_ytdlp_json(result.stdout)
 
         # Build quality options — keep best format per resolution
         best_by_height = {}
@@ -240,6 +258,34 @@ def get_info():
         })
     except subprocess.TimeoutExpired:
         return jsonify({"error": "Timed out fetching video info"}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/playlist", methods=["POST"])
+def get_playlist_info():
+    data = request.json
+    url = data.get("url", "").strip()
+    if not url:
+        return jsonify({"error": "No URL provided"}), 400
+
+    # --flat-playlist only lists entries, so this stays cheap even for huge
+    # playlists. Capped because every returned URL becomes its own /api/info
+    # call and its own queued download.
+    cmd = ytdlp_cmd(
+        "--flat-playlist", "-J", "-I", f"1:{MAX_PLAYLIST_ITEMS}", url, no_playlist=False
+    )
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if result.returncode != 0:
+            return jsonify({"error": result.stderr.strip().split("\n")[-1]}), 400
+
+        info = parse_ytdlp_json(result.stdout)
+        entries = info.get("entries") or []
+        urls = [e.get("url") for e in entries if e.get("url")]
+        return jsonify({"urls": urls, "truncated": len(urls) >= MAX_PLAYLIST_ITEMS})
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "Timed out fetching playlist info"}), 400
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
