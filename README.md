@@ -125,10 +125,58 @@ Anything [yt-dlp supports](https://github.com/yt-dlp/yt-dlp/blob/master/supporte
 
 YouTube, TikTok, Instagram, Twitter/X, Reddit, Facebook, Vimeo, Twitch, Dailymotion, SoundCloud, Loom, Streamable, Pinterest, Tumblr, Threads, LinkedIn, and many more.
 
-**Not supported: DRM-protected services.** Spotify, Apple Music, Tidal, Netflix and
-similar are recognized by yt-dlp and deliberately refused — their streams are
-Widevine-encrypted, and yt-dlp does not circumvent DRM. For music, use sources that
-serve unencrypted audio (SoundCloud, Bandcamp, YouTube Music, podcast feeds) in MP3 mode.
+**Not supported: DRM-protected streams.** Apple Music, Tidal, Netflix and similar
+are recognized by yt-dlp and deliberately refused — their streams are
+Widevine-encrypted, and yt-dlp does not circumvent DRM. Spotify links are handled,
+but as *metadata* only; see below.
+
+## Spotify links (metadata matching)
+
+Paste a Spotify track, playlist, album, or artist link and ReClip will read its
+**metadata** — artist, title, duration — then look for the same recording on a
+source that serves unencrypted audio and download that.
+
+Spotify's own audio is never touched. It is Widevine-encrypted, yt-dlp refuses it
+by design, and nothing here works around that. **You therefore do not get "the
+Spotify file"** — you get a different upload of the same recording, matched on
+metadata. Matching can be wrong, so duration is used as a guard: a candidate whose
+length disagrees with Spotify's by more than `SPOTIFY_DURATION_TOLERANCE` seconds
+is rejected rather than downloaded on a guess. Tracks with no confident match are
+reported in the UI instead of being silently skipped.
+
+No Spotify account, app registration, or credentials are needed. Metadata comes
+from Spotify's public embed page.
+
+**Limits, all verified rather than assumed:**
+
+| Link | Yields |
+|---|---|
+| `/track/…` | that track |
+| `/playlist/…` | up to **100** tracks |
+| `/album/…` | up to **100** tracks |
+| `/artist/…` | that artist's **top 10** |
+
+The 100-track cap is Spotify's, not ReClip's — the embed page stops there, and the
+UI says so when a playlist is larger. The official Web API is deliberately not
+used: since February 2026 it returns playlist contents only for playlists the
+authenticated user owns or collaborates on, and an app-only token has no user, so
+registering an app would not lift the cap either. Reading all of a large playlist
+would require an OAuth login as its owner, which ReClip does not implement.
+
+This reads an *internal* structure of Spotify's embed page, not a documented API,
+so Spotify can change it without notice. When that happens the lookup fails with
+an explanation rather than silently returning nothing.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `SPOTIFY_DURATION_TOLERANCE` | `15` | Max seconds a candidate's length may differ before it is rejected |
+| `SPOTIFY_SEARCH_RESULTS` | `5` | Candidates fetched per track before ranking |
+| `SPOTIFY_MATCH_WORKERS` | `4` | Concurrent metadata searches |
+| `SPOTIFY_SEARCH_TIMEOUT` | `90` | Per-track search timeout, seconds |
+| `SPOTIFY_HTTP_TIMEOUT` | `30` | Spotify page fetch timeout, seconds |
+
+Respect the terms of service of every service involved, and the rights of the
+people whose work you are downloading.
 
 ## Stack
 

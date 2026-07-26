@@ -8,6 +8,8 @@ import subprocess
 import threading
 from flask import Flask, request, jsonify, send_file, render_template, redirect
 
+import spotify
+
 app = Flask(__name__)
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", os.path.join(os.path.dirname(__file__), "downloads"))
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -288,6 +290,27 @@ def get_playlist_info():
         return jsonify({"error": "Timed out fetching playlist info"}), 400
     except Exception as e:
         return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/spotify", methods=["POST"])
+def get_spotify_tracks():
+    """Resolve a Spotify link to matched, non-DRM source URLs.
+
+    Metadata only — see spotify.py. Returns the same ``urls`` shape as
+    /api/playlist, plus what it could not match, so the UI can say so instead of
+    silently dropping tracks.
+    """
+    data = request.json
+    url = (data.get("url") or "").strip()
+    if not url:
+        return jsonify({"error": "No URL provided"}), 400
+
+    try:
+        return jsonify(spotify.resolve(url, ytdlp_cmd))
+    except spotify.SpotifyError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": f"Spotify lookup failed: {e}"}), 400
 
 
 @app.route("/api/download", methods=["POST"])

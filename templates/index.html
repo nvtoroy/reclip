@@ -144,6 +144,17 @@
     /* Cards */
     .cards { margin-top: 24px; }
 
+    .notice {
+      margin-top: 20px;
+      padding: 11px 14px;
+      border: 1.5px solid var(--card-border);
+      border-radius: var(--radius);
+      background: var(--card);
+      font-size: 13px;
+      line-height: 1.55;
+      opacity: 0.85;
+    }
+
     .card {
       display: flex;
       gap: 14px;
@@ -462,9 +473,57 @@
       }
     }
 
+    function isSpotifyUrl(url) {
+      return /(?:open\.spotify\.com\/(?:intl-[a-z]{2}\/)?|spotify:)(playlist|album|artist|track)[/:]/.test(url);
+    }
+
+    // Spotify links carry no audio we can fetch — the server reads their
+    // metadata and hands back matched sources. Tracks it could not match
+    // confidently are reported rather than quietly dropped.
+    function showNotice(lines) {
+      if (!lines.length) return;
+      const el = document.createElement('div');
+      el.className = 'notice';
+      el.innerHTML = lines.map(esc).join('<br>');
+      document.getElementById('cards').before(el);
+    }
+
+    async function expandSpotify(url, notices) {
+      const res = await fetch('/api/spotify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url }),
+      });
+      if (res.status === 401) { window.location = '/login'; return null; }
+      const data = await res.json();
+      if (data.error) { notices.push(`Spotify: ${data.error}`); return []; }
+      if (data.note) notices.push(data.note);
+      if (data.unmatched?.length) {
+        notices.push(
+          `No confident match for ${data.unmatched.length} of ${data.total} track(s): ` +
+          data.unmatched.join('; ')
+        );
+      }
+      if (data.label) {
+        notices.push(`${data.label}: matched ${data.urls.length} of ${data.total} track(s).`);
+      }
+      return data.urls || [];
+    }
+
     async function expandPlaylists(urls) {
       const out = [];
+      const notices = [];
       for (const url of urls) {
+        if (isSpotifyUrl(url)) {
+          try {
+            const expanded = await expandSpotify(url, notices);
+            if (expanded === null) return null;
+            out.push(...expanded);
+          } catch (err) {
+            notices.push(`Spotify lookup failed: ${err.message}`);
+          }
+          continue;
+        }
         if (!isPlaylistUrl(url)) { out.push(url); continue; }
         try {
           const res = await fetch('/api/playlist', {
@@ -481,6 +540,7 @@
           out.push(url);
         }
       }
+      showNotice(notices);
       return [...new Set(out)];
     }
 
