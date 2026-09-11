@@ -49,8 +49,11 @@ All settings are environment variables — no config files:
 | `AUTH_TOKEN` | *(empty — auth off)* | Access token required to use the app. **Set this before exposing to the internet.** |
 | `FILE_TTL_MINUTES` | `60` | Downloaded files and finished jobs are auto-deleted after this many minutes |
 | `MAX_CONCURRENT_DOWNLOADS` | `2` | Simultaneous yt-dlp downloads; extra jobs wait in a queue |
-| `MAX_FILESIZE` | `2G` | Per-file size limit passed to yt-dlp |
-| `DOWNLOAD_TIMEOUT` | `300` | Per-download timeout in seconds |
+| `MAX_FILESIZE` | `2G` | Per-file size limit. Passed to yt-dlp and also enforced by watching the partial file, since yt-dlp ignores `--max-filesize` when aria2c does the transfer |
+| `DOWNLOAD_TIMEOUT` | `3600` | Hard ceiling per download, in seconds. A backstop only — stalls are caught by `DOWNLOAD_STALL_TIMEOUT` |
+| `DOWNLOAD_STALL_TIMEOUT` | `120` | Abort after this many seconds with no output from yt-dlp. This is what detects a dead transfer, so a slow one is left to finish |
+| `USE_ARIA2C` | `1` | Use aria2c for plain-file downloads when the binary is present. Set to `0` to force yt-dlp's own downloader |
+| `ARIA2C_CONNECTIONS` | `8` | Parallel connections aria2c opens per file |
 | `MAX_PLAYLIST_ITEMS` | `50` | How many videos a pasted playlist URL expands to; the rest are ignored |
 | `YTDLP_COOKIES_FILE` | *(empty)* | Path to a Netscape-format cookies file, passed to yt-dlp (`--cookies`). Helps with "confirm you're not a bot" checks on datacenter IPs |
 | `DOWNLOAD_DIR` | `./downloads` (`/tmp/reclip-downloads` in Docker) | Where files are staged before being sent to the browser |

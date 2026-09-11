@@ -3,9 +3,11 @@ import time
 import uuid
 import glob
 import json
+import shutil
 import secrets
 import subprocess
 import threading
+from collections import deque
 from flask import Flask, request, jsonify, send_file, render_template, redirect
 
 import spotify
@@ -22,10 +24,24 @@ AUTH_COOKIE_MAX_AGE = 30 * 24 * 3600
 FILE_TTL_MINUTES = int(os.environ.get("FILE_TTL_MINUTES", "60"))
 MAX_CONCURRENT_DOWNLOADS = int(os.environ.get("MAX_CONCURRENT_DOWNLOADS", "2"))
 MAX_FILESIZE = os.environ.get("MAX_FILESIZE", "2G")
-DOWNLOAD_TIMEOUT = int(os.environ.get("DOWNLOAD_TIMEOUT", "300"))
+# Hard ceiling for one download. Deliberately generous: a slow-but-alive
+# transfer should be caught by DOWNLOAD_STALL_TIMEOUT, not by this.
+DOWNLOAD_TIMEOUT = int(os.environ.get("DOWNLOAD_TIMEOUT", "3600"))
+# yt-dlp and aria2c both print progress every few seconds, so going silent is
+# the only reliable "this transfer is dead" signal. Wall-clock time cannot tell
+# a 300 MB file on a throttled host from a stuck socket, and used to kill both.
+DOWNLOAD_STALL_TIMEOUT = int(os.environ.get("DOWNLOAD_STALL_TIMEOUT", "120"))
 MAX_PLAYLIST_ITEMS = int(os.environ.get("MAX_PLAYLIST_ITEMS", "50"))
 # Optional Netscape-format cookies file for yt-dlp — helps with bot checks on datacenter IPs.
 YTDLP_COOKIES_FILE = os.environ.get("YTDLP_COOKIES_FILE", "")
+
+# aria2c fetches a single file over several connections, which roughly doubles
+# throughput against hosts that throttle per connection. Optional: without the
+# binary present we fall back to yt-dlp's own downloader.
+ARIA2C_CONNECTIONS = int(os.environ.get("ARIA2C_CONNECTIONS", "8"))
+USE_ARIA2C = (
+    os.environ.get("USE_ARIA2C", "1") == "1" and shutil.which("aria2c") is not None
+)
 
 jobs = {}
 download_slots = threading.BoundedSemaphore(MAX_CONCURRENT_DOWNLOADS)
@@ -54,6 +70,123 @@ def parse_ytdlp_json(stdout):
             continue
         return json.loads(line)
     raise ValueError("yt-dlp returned no data")
+
+
+def parse_size(text):
+    """Parse a yt-dlp style size such as ``2G`` or ``500M`` into bytes.
+
+    Returns 0 for anything unparseable, which callers read as "no limit".
+    """
+    text = str(text).strip().upper().rstrip("B")
+    if not text:
+        return 0
+    units = {"K": 1024, "M": 1024 ** 2, "G": 1024 ** 3, "T": 1024 ** 4}
+    try:
+        if text[-1] in units:
+            return int(float(text[:-1]) * units[text[-1]])
+        return int(float(text))
+    except ValueError:
+        return 0
+
+
+MAX_FILESIZE_BYTES = parse_size(MAX_FILESIZE)
+
+
+def last_error_line(output):
+    """Pull the real error out of yt-dlp output with stderr merged into stdout.
+
+    The tail of the stream is usually a progress line, so the last ``ERROR:``
+    wins over it.
+    """
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    for line in reversed(lines):
+        if line.startswith("ERROR:"):
+            return line
+    return lines[-1] if lines else "Download failed"
+
+
+def partial_size(job_id):
+    """Bytes currently on disk for a job, partial files included."""
+    total = 0
+    for path in glob.glob(os.path.join(DOWNLOAD_DIR, f"{job_id}.*")):
+        try:
+            total += os.path.getsize(path)
+        except OSError:
+            pass
+    return total
+
+
+def run_ytdlp(cmd, job_id=None, size_cap=0):
+    """Run yt-dlp, killing it only once it genuinely stops making progress.
+
+    ``subprocess.run(timeout=...)`` cannot distinguish a slow transfer from a
+    dead one, so large files on throttled hosts were killed mid-download. The
+    signal used instead is the partial file growing: aria2c keeps printing
+    progress and retry chatter long after a transfer has actually died, so
+    output alone marks a stuck download as healthy. Output still counts before
+    the first byte lands, while yt-dlp is only resolving the page and no file
+    exists yet. Wall-clock time remains as a backstop.
+
+    ``size_cap`` re-implements ``--max-filesize``, which yt-dlp does not enforce
+    when an external downloader performs the transfer.
+
+    Returns ``(returncode, output, aborted)`` where ``aborted`` is None or the
+    reason this process was killed.
+    """
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    # Bounded so a long download cannot grow this without limit. Progress lines
+    # are short and what matters on failure sits at the end anyway.
+    chunks = deque(maxlen=4096)
+    last_output = [time.time()]
+
+    def pump():
+        fd = proc.stdout.fileno()
+        while True:
+            try:
+                # Read raw rather than by line: aria2c separates progress with
+                # carriage returns, and readline() would block until it exits.
+                chunk = os.read(fd, 65536)
+            except (OSError, ValueError):
+                break
+            if not chunk:
+                break
+            last_output[0] = time.time()
+            chunks.append(chunk)
+
+    reader = threading.Thread(target=pump, daemon=True)
+    reader.start()
+
+    deadline = time.time() + DOWNLOAD_TIMEOUT
+    aborted = None
+    last_progress = time.time()
+    peak_bytes = 0
+    while proc.poll() is None:
+        time.sleep(0.5)
+        now = time.time()
+        on_disk = partial_size(job_id) if job_id else 0
+
+        if on_disk > peak_bytes:
+            peak_bytes = on_disk
+            last_progress = now
+        elif peak_bytes == 0:
+            # Nothing fetched yet, so yt-dlp is still resolving the page and
+            # its chatter is the only sign of life there is.
+            last_progress = max(last_progress, last_output[0])
+
+        if size_cap and on_disk > size_cap:
+            aborted = f"File exceeds the {MAX_FILESIZE} size limit"
+        elif now - last_progress > DOWNLOAD_STALL_TIMEOUT:
+            aborted = f"Download stalled — no progress for {DOWNLOAD_STALL_TIMEOUT}s"
+        elif now > deadline:
+            aborted = f"Download timed out ({DOWNLOAD_TIMEOUT // 60} min limit)"
+        if aborted:
+            proc.kill()
+            break
+
+    proc.wait()
+    reader.join(timeout=2)
+    output = b"".join(chunks).decode("utf-8", "replace")
+    return proc.returncode, output, aborted
 
 
 def cleanup_job_files(job_id):
@@ -151,7 +284,23 @@ def do_download(job_id, url, format_choice, format_id):
     job = jobs[job_id]
     out_template = os.path.join(DOWNLOAD_DIR, f"{job_id}.%(ext)s")
 
-    cmd = ytdlp_cmd("-o", out_template, "--max-filesize", MAX_FILESIZE)
+    # --max-filesize is kept for the native downloader, which honours it. It is
+    # silently ignored when aria2c does the transfer, so run_ytdlp() enforces
+    # the same ceiling by watching the partial file.
+    cmd = ytdlp_cmd("-o", out_template, "--max-filesize", MAX_FILESIZE, "--newline")
+
+    if USE_ARIA2C:
+        # http only. yt-dlp dropped aria2c for HLS/DASH after an RCE in fragment
+        # handling, so fragmented streams stay on the native downloader.
+        # --file-allocation=none stops aria2c preallocating the full size up
+        # front, which would make the partial file look complete to the size
+        # guard the moment it starts.
+        cmd += [
+            "--downloader", "http:aria2c",
+            "--downloader-args",
+            f"aria2c:-x{ARIA2C_CONNECTIONS} -s{ARIA2C_CONNECTIONS} -k1M "
+            "--file-allocation=none --summary-interval=5",
+        ]
 
     if format_choice == "audio":
         cmd += ["-x", "--audio-format", "mp3"]
@@ -163,17 +312,25 @@ def do_download(job_id, url, format_choice, format_id):
     cmd.append(url)
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=DOWNLOAD_TIMEOUT)
-        if result.returncode != 0:
+        returncode, output, aborted = run_ytdlp(
+            cmd, job_id=job_id, size_cap=MAX_FILESIZE_BYTES
+        )
+        if aborted:
             job["status"] = "error"
-            job["error"] = result.stderr.strip().split("\n")[-1]
+            job["error"] = aborted
+            cleanup_job_files(job_id)
+            return
+
+        if returncode != 0:
+            job["status"] = "error"
+            job["error"] = last_error_line(output)
             cleanup_job_files(job_id)
             return
 
         files = glob.glob(os.path.join(DOWNLOAD_DIR, f"{job_id}.*"))
         if not files:
             job["status"] = "error"
-            if "max-filesize" in result.stdout or "max-filesize" in result.stderr:
+            if "max-filesize" in output:
                 job["error"] = f"File exceeds the {MAX_FILESIZE} size limit"
             else:
                 job["error"] = "Download completed but no file was found"
@@ -203,10 +360,6 @@ def do_download(job_id, url, format_choice, format_id):
             job["filename"] = f"{safe_title}{ext}" if safe_title else os.path.basename(chosen)
         else:
             job["filename"] = os.path.basename(chosen)
-    except subprocess.TimeoutExpired:
-        job["status"] = "error"
-        job["error"] = f"Download timed out ({DOWNLOAD_TIMEOUT // 60} min limit)"
-        cleanup_job_files(job_id)
     except Exception as e:
         job["status"] = "error"
         job["error"] = str(e)
