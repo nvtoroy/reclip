@@ -4,9 +4,11 @@ import uuid
 import glob
 import json
 import shutil
+import signal
 import secrets
 import subprocess
 import threading
+import urllib.parse
 from collections import deque
 from flask import Flask, request, jsonify, send_file, render_template, redirect
 
@@ -39,6 +41,10 @@ YTDLP_COOKIES_FILE = os.environ.get("YTDLP_COOKIES_FILE", "")
 # throughput against hosts that throttle per connection. Optional: without the
 # binary present we fall back to yt-dlp's own downloader.
 ARIA2C_CONNECTIONS = int(os.environ.get("ARIA2C_CONNECTIONS", "8"))
+# Empty means unlimited. yt-dlp forwards this to aria2c as
+# --max-overall-download-limit, so one setting covers both downloaders. Worth
+# setting when the box shares its uplink with something latency-sensitive.
+DOWNLOAD_RATE_LIMIT = os.environ.get("DOWNLOAD_RATE_LIMIT", "")
 USE_ARIA2C = (
     os.environ.get("USE_ARIA2C", "1") == "1" and shutil.which("aria2c") is not None
 )
@@ -70,6 +76,39 @@ def parse_ytdlp_json(stdout):
             continue
         return json.loads(line)
     raise ValueError("yt-dlp returned no data")
+
+
+def valid_media_url(url):
+    """Whether a user-supplied string is safe to hand to yt-dlp as a URL.
+
+    yt-dlp parses its own argv, so a string starting with "-" is read as an
+    option instead of a URL — and some of its options run commands. Commands
+    are built with a "--" terminator too, but this check is the half that does
+    not depend on yt-dlp's parser behaving as documented.
+
+    Pinning the scheme also keeps file:// and the other protocols its
+    extractors accept from being used to read the container's own filesystem.
+    """
+    if not url or url.startswith("-"):
+        return False
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except ValueError:
+        return False
+    return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+
+
+def kill_process_group(proc):
+    """Kill yt-dlp and everything it spawned.
+
+    proc.kill() reaches yt-dlp alone. aria2c and ffmpeg are its children, so
+    they would outlive it — still transferring, still holding the partial files
+    the caller is about to unlink.
+    """
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        proc.kill()
 
 
 def parse_size(text):
@@ -144,7 +183,11 @@ def run_ytdlp(cmd, job_id=None, size_cap=0):
     Returns ``(returncode, output, aborted)`` where ``aborted`` is None or the
     reason this process was killed.
     """
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    # start_new_session puts yt-dlp in its own process group so the whole tree
+    # can be signalled at once — see kill_process_group().
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True
+    )
     # Bounded so a long download cannot grow this without limit. Progress lines
     # are short and what matters on failure sits at the end anyway.
     chunks = deque(maxlen=4096)
@@ -191,7 +234,7 @@ def run_ytdlp(cmd, job_id=None, size_cap=0):
         elif now > deadline:
             aborted = f"Download timed out ({DOWNLOAD_TIMEOUT // 60} min limit)"
         if aborted:
-            proc.kill()
+            kill_process_group(proc)
             break
 
     proc.wait()
@@ -313,6 +356,9 @@ def do_download(job_id, url, format_choice, format_id):
             "--file-allocation=none --summary-interval=5",
         ]
 
+    if DOWNLOAD_RATE_LIMIT:
+        cmd += ["--limit-rate", DOWNLOAD_RATE_LIMIT]
+
     if format_choice == "audio":
         cmd += ["-x", "--audio-format", "mp3"]
     elif format_id:
@@ -320,7 +366,7 @@ def do_download(job_id, url, format_choice, format_id):
     else:
         cmd += ["-f", "bestvideo+bestaudio/best", "--merge-output-format", "mp4"]
 
-    cmd.append(url)
+    cmd += ["--", url]
 
     try:
         returncode, output, aborted = run_ytdlp(
@@ -388,8 +434,10 @@ def get_info():
     url = data.get("url", "").strip()
     if not url:
         return jsonify({"error": "No URL provided"}), 400
+    if not valid_media_url(url):
+        return jsonify({"error": "Only http:// and https:// links are accepted"}), 400
 
-    cmd = ytdlp_cmd("-j", url)
+    cmd = ytdlp_cmd("-j", "--", url)
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         if result.returncode != 0:
@@ -434,12 +482,15 @@ def get_playlist_info():
     url = data.get("url", "").strip()
     if not url:
         return jsonify({"error": "No URL provided"}), 400
+    if not valid_media_url(url):
+        return jsonify({"error": "Only http:// and https:// links are accepted"}), 400
 
     # --flat-playlist only lists entries, so this stays cheap even for huge
     # playlists. Capped because every returned URL becomes its own /api/info
     # call and its own queued download.
     cmd = ytdlp_cmd(
-        "--flat-playlist", "-J", "-I", f"1:{MAX_PLAYLIST_ITEMS}", url, no_playlist=False
+        "--flat-playlist", "-J", "-I", f"1:{MAX_PLAYLIST_ITEMS}", "--", url,
+        no_playlist=False,
     )
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
@@ -468,6 +519,8 @@ def get_spotify_tracks():
     url = (data.get("url") or "").strip()
     if not url:
         return jsonify({"error": "No URL provided"}), 400
+    if not valid_media_url(url):
+        return jsonify({"error": "Only http:// and https:// links are accepted"}), 400
 
     try:
         return jsonify(spotify.resolve(url, ytdlp_cmd))
@@ -487,6 +540,8 @@ def start_download():
 
     if not url:
         return jsonify({"error": "No URL provided"}), 400
+    if not valid_media_url(url):
+        return jsonify({"error": "Only http:// and https:// links are accepted"}), 400
 
     job_id = uuid.uuid4().hex[:10]
     jobs[job_id] = {"status": "queued", "url": url, "title": title}
