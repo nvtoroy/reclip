@@ -1,0 +1,86 @@
+# ReClip on the Contabo box — https://d.cegth.cc:8900
+#
+# This host already runs a Reality VPN (mypvn, ports 443 + 8443), the r-service
+# stack and davinci-assist. Every choice below exists to keep them untouched:
+#
+#   * Port 8900, never 443: 443 belongs to mypvn.
+#   * Nothing on port 80: every certificate on this host renews through
+#     certbot's standalone authenticator, which binds 80 itself at renewal
+#     time. A permanent listener there breaks renewal for dva.melekh.in,
+#     r-service.cegth.cc and the sslip.io lineage, silently, weeks later.
+#   * nginx is pinned by digest, not by the 1.27-alpine tag. rs-edge-1 and
+#     davinci-assist-ingress run that same tag, so pulling it would re-point it
+#     under them and arm a surprise recreate on their next restart.
+#   * Downloads live on a separate 5G filesystem, so filling it cannot reach
+#     the rs databases sharing /dev/sda1.
+#   * Explicit cgroup caps, so an overloaded reclip is killed inside its own
+#     cgroup instead of letting the host OOM killer pick rs-search or postgres,
+#     which are the larger RSS on this box.
+
+name: reclip
+
+services:
+  app:
+    build:
+      context: ./src
+    image: reclip:dev
+    container_name: reclip-app
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # /downloads is the 5G loopback filesystem, not the shared root.
+      DOWNLOAD_DIR: /downloads
+      CLEAN_DOWNLOAD_DIR_ON_START: "1"
+      # Tuned against a 5G store rather than the 2G/60min local defaults: one
+      # file cannot monopolise it, and finished files do not park against the
+      # ceiling for an hour.
+      MAX_FILESIZE: 1G
+      FILE_TTL_MINUTES: "15"
+      MAX_CONCURRENT_DOWNLOADS: "1"
+      # The uplink is shared with the VPN, so cap the transfer rather than let
+      # aria2c take whatever the NIC gives.
+      ARIA2C_CONNECTIONS: "4"
+      DOWNLOAD_RATE_LIMIT: 15M
+    volumes:
+      - /var/lib/reclip:/downloads
+    # No ports. The app is reachable only through the ingress below: Docker
+    # writes its iptables rules ahead of ufw, so anything published here would
+    # be on the internet regardless of ufw's default-deny.
+    mem_limit: 1536m
+    memswap_limit: 1536m
+    cpus: 1.5
+    pids_limit: 512
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+  ingress:
+    # nginx:1.27-alpine as already present on this host. Pinned by digest on
+    # purpose — see the header.
+    image: nginx@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10
+    container_name: reclip-ingress
+    restart: unless-stopped
+    depends_on:
+      - app
+    # Bound to the v4 address: d.cegth.cc has an A record and no AAAA, so an
+    # IPv6 listener would only be unreachable surface.
+    ports:
+      - "169.58.95.115:8900:8900"
+    volumes:
+      # Only this one lineage. The whole /etc/letsencrypt tree also holds the
+      # private keys for dva.melekh.in, r-service.cegth.cc and the sslip.io
+      # certificate, and this is the one new process facing the internet.
+      # live/ holds relative symlinks into archive/, so both are needed.
+      - /etc/letsencrypt/live/d.cegth.cc:/etc/letsencrypt/live/d.cegth.cc:ro
+      - /etc/letsencrypt/archive/d.cegth.cc:/etc/letsencrypt/archive/d.cegth.cc:ro
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    mem_limit: 128m
+    pids_limit: 128
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
