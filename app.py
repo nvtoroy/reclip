@@ -106,13 +106,24 @@ def last_error_line(output):
 
 
 def partial_size(job_id):
-    """Bytes currently on disk for a job, partial files included."""
+    """Bytes actually occupied on disk by a job, partial files included.
+
+    Allocated blocks rather than apparent length. aria2c fetches segments in
+    parallel, so with --file-allocation=none the partial file is sparse: its
+    apparent size leaps to near the total the moment the last segment opens,
+    while the holes between segments take minutes more to fill. Apparent size
+    therefore flatlines mid-download and would read as a stall, and it also
+    overstates how much disk a job has really consumed.
+    """
     total = 0
     for path in glob.glob(os.path.join(DOWNLOAD_DIR, f"{job_id}.*")):
         try:
-            total += os.path.getsize(path)
+            info = os.stat(path)
         except OSError:
-            pass
+            continue
+        # st_blocks is POSIX-only and always counted in 512-byte units.
+        blocks = getattr(info, "st_blocks", None)
+        total += blocks * 512 if blocks is not None else info.st_size
     return total
 
 
